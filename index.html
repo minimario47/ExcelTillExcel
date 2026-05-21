@@ -3,17 +3,87 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title></title>
-  <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+  <title>Tågnummer</title>
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 32px;
+      color: #111827;
+    }
+
+    #fileInput {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+    }
+
+    label {
+      display: inline-flex;
+      align-items: center;
+      min-height: 40px;
+      padding: 0 16px;
+      border: 1px solid #9ca3af;
+      border-radius: 6px;
+      background: #fff;
+      cursor: pointer;
+    }
+
+    label:hover {
+      background: #f3f4f6;
+    }
+
+    #status {
+      min-height: 24px;
+      margin-top: 16px;
+      color: #4b5563;
+    }
+  </style>
 </head>
 <body>
-  <input id="fileInput" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" style="display:none" />
-  <label for="fileInput">ladda upp fil</label>
+  <input id="fileInput" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+  <label for="fileInput">Ladda upp fil</label>
+  <p id="status" role="status" aria-live="polite"></p>
 
   <script>
 (function () {
-  var ONE_DAY_FMT = '"1d"\\ hh:mm';
+  var ONE_DAY_FMT = '"1d" h:mm';
   var RE_1D = /^1d\s+(\d{1,2}):(\d{2})$/i;
+  var RE_HM = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/;
+  /** Excel epoch (serial 0) = 1899-12-30 UTC (ExcelJS / Excel on Windows semantics). */
+  var EXCEL_EPOCH_MS = Date.UTC(1899, 11, 30);
+  var statusEl = document.getElementById('status');
+
+  function setStatus(message) {
+    if (statusEl) statusEl.textContent = message || '';
+  }
+
+  function plainValue(v) {
+    if (v && typeof v === 'object' && !(v instanceof Date)) {
+      if (v.result !== undefined && v.result !== null) return v.result;
+      if (v.text !== undefined && v.text !== null) return v.text;
+      if (Array.isArray(v.richText)) {
+        return v.richText
+          .map(function (part) { return part && part.text ? part.text : ''; })
+          .join('');
+      }
+    }
+    return v;
+  }
+
+  function textValue(v) {
+    var raw = plainValue(v);
+    if (raw === null || raw === undefined) return '';
+    if (raw instanceof Date) return '';
+    return String(raw).trim();
+  }
+
+  function normalizeHeader(v) {
+    return textValue(v).normalize('NFC').replace(/\s+/g, ' ').toLocaleLowerCase('sv-SE');
+  }
 
   function oneDayStringToSerial(s) {
     if (!s || typeof s !== 'string') return null;
@@ -21,48 +91,46 @@
     if (!m) return null;
     var h = parseInt(m[1], 10);
     var min = parseInt(m[2], 10);
+    if (h < 0 || h > 23 || min < 0 || min > 59) return null;
     return 1 + (h * 60 + min) / (24 * 60);
   }
 
-  /**
-   * @param {*} value cell value (SheetJS parsed)
-   * @param {*} cell optional cell ref for fallback string from formatted text
-   */
-  function parseTimeToMinutes(value, cell) {
-    if (value === null || value === undefined || value === '') return null;
+  function timeStringToSerialDay(s) {
+    if (typeof s !== 'string') return null;
+    var trimmed = s.trim();
+    var overnight = oneDayStringToSerial(trimmed);
+    if (overnight !== null) return overnight;
 
-    if (typeof value === 'string') {
-      var sm = String(value).trim().match(RE_1D);
-      if (sm) {
-        var h1 = parseInt(sm[1], 10);
-        var m1 = parseInt(sm[2], 10);
-        return 24 * 60 + h1 * 60 + m1;
-      }
-      var hm = String(value).trim().match(/^(\d{1,2}):(\d{2})$/);
-      if (hm) return parseInt(hm[1], 10) * 60 + parseInt(hm[2], 10);
+    var m = trimmed.match(RE_HM);
+    if (!m) return null;
+    var h = parseInt(m[1], 10);
+    var min = parseInt(m[2], 10);
+    var sec = parseInt(m[3] || '0', 10);
+    if (h < 0 || h > 23 || min < 0 || min > 59 || sec < 0 || sec > 59) return null;
+    return (h * 60 + min + sec / 60) / (24 * 60);
+  }
+
+  /**
+   * Fractional Excel days comparable for (dep-arr)*24 gaps.
+   * @returns {number|null}
+   */
+  function cellToFracDays(cell) {
+    if (!cell || cell.value === undefined || cell.value === null || cell.value === '') {
       return null;
     }
-
-    if (typeof value === 'number') {
-      if (!isFinite(value)) return null;
-      return Math.round(value * 24 * 60);
+    var v = plainValue(cell.value);
+    var parsedText = timeStringToSerialDay(v);
+    if (parsedText !== null) return parsedText;
+    if (v instanceof Date) {
+      return (v.getTime() - EXCEL_EPOCH_MS) / 86400000;
     }
-
-    if (value instanceof Date && !isNaN(value.getTime())) {
-      var epoch = Date.UTC(1899, 11, 30);
-      var days = Math.floor((value.getTime() - epoch) / 86400000);
-      if (days < 0) days = 0;
-      return days * 24 * 60 + value.getUTCHours() * 60 + value.getUTCMinutes();
-    }
-
-    if (cell && typeof cell.w === 'string') {
-      return parseTimeToMinutes(cell.w, null);
-    }
-
+    if (typeof v === 'number' && isFinite(v)) return v;
+    if (typeof cell.text === 'string') return timeStringToSerialDay(cell.text);
     return null;
   }
 
   function normalizeTrainNo(v) {
+    v = plainValue(v);
     if (v === null || v === undefined) return '';
     if (typeof v === 'number' && isFinite(v)) {
       if (Math.floor(v) === v) return String(Math.trunc(v));
@@ -71,7 +139,22 @@
       return s.replace(/\.0+$/, '');
     }
     var t = String(v).trim();
+    t = t.replace(/\.0+$/, '');
     return t;
+  }
+
+  function withCellNumFmt(cell, numFmt) {
+    cell.style = Object.assign({}, cell.style || {}, { numFmt: numFmt });
+  }
+
+  function convert1dTimeStringIfNeeded(cell) {
+    var v = plainValue(cell.value);
+    if (typeof v !== 'string' || !RE_1D.test(String(v).trim())) return;
+    var ser = oneDayStringToSerial(v);
+    if (ser == null) return;
+    cell.value = ser;
+    withCellNumFmt(cell, ONE_DAY_FMT);
+    return true;
   }
 
   function triggerDownload(blob, filename) {
@@ -85,92 +168,87 @@
     setTimeout(function () { URL.revokeObjectURL(a.href); }, 0);
   }
 
+  function buildHeaderColMap(ws) {
+    var map = {};
+    var row1 = ws.getRow(1);
+    row1.eachCell(function (cell, colNumber) {
+      var h = normalizeHeader(cell.value);
+      if (h && map[h] === undefined) map[h] = colNumber;
+    });
+    return map;
+  }
+
+  function requiredColumn(colMap, header) {
+    return colMap[normalizeHeader(header)];
+  }
+
+  /**
+   * @param {ExcelJS.Workbook} wb
+   */
   function processWorkbook(wb) {
-    if (!wb.SheetNames.length) return false;
-    var sheetName = wb.SheetNames[0];
-    var ws = wb.Sheets[sheetName];
-    var ref = ws['!ref'];
-    if (!ref) return false;
-    var rng = XLSX.utils.decode_range(ref);
-    if (rng.e.r < 1) return false;
+    var ws = wb.worksheets[0];
+    if (!ws) return false;
+    var last = ws.rowCount || 0;
+    if (last < 2) return false;
 
-    var headerRow = 0;
-    var colIndex = {};
+    var colMap = buildHeaderColMap(ws);
+    var colTag = requiredColumn(colMap, 'Tåg');
+    var colAnkomst = requiredColumn(colMap, 'Ankomsttid');
+    var colAvgang = requiredColumn(colMap, 'Avgångstid');
+    var colNytt = requiredColumn(colMap, 'Nytt tågnummer');
 
-    function getHeaderVal(c) {
-      var addr = XLSX.utils.encode_cell({ r: headerRow, c: c });
-      var cell = ws[addr];
-      if (!cell) return '';
-      if (typeof cell.v === 'string') return cell.v.trim();
-      if (cell.v != null && cell.v !== '') return String(cell.v).trim();
-      if (typeof cell.w === 'string') return cell.w.trim();
-      return '';
-    }
-
-    var c;
-    for (c = rng.s.c; c <= rng.e.c; c++) {
-      var h = getHeaderVal(c);
-      if (h && colIndex[h] === undefined) colIndex[h] = c;
-    }
-
-    var colTåg = colIndex['Tåg'];
-    var colAnkomst = colIndex['Ankomsttid'];
-    var colAvgång = colIndex['Avgångstid'];
-    var colNytt = colIndex['Nytt tågnummer'];
-
-    if (colTåg === undefined || colAnkomst === undefined || colAvgång === undefined || colNytt === undefined) {
+    if (
+      colTag === undefined ||
+      colAnkomst === undefined ||
+      colAvgang === undefined ||
+      colNytt === undefined
+    ) {
       return false;
     }
 
-    var r;
-    for (r = headerRow + 1; r <= rng.e.r; r++) {
-      var addrG = XLSX.utils.encode_cell({ r: r, c: colAvgång });
-      var cellG = ws[addrG];
-      var gVal = cellG ? cellG.v : undefined;
-      if (typeof gVal === 'string' && RE_1D.test(gVal.trim())) {
-        var ser = oneDayStringToSerial(gVal);
-        if (ser != null) {
-          ws[addrG] = { t: 'n', v: ser, z: ONE_DAY_FMT };
-          cellG = ws[addrG];
-          gVal = ser;
-        }
-      }
+    if (colNytt === colTag || colNytt === colAnkomst || colNytt === colAvgang) {
+      return false;
+    }
 
-      var addrE = XLSX.utils.encode_cell({ r: r, c: colAnkomst });
-      var cellE = ws[addrE];
-      var eVal = cellE ? cellE.v : undefined;
-      if (typeof eVal === 'string' && RE_1D.test(String(eVal).trim())) {
-        var serE = oneDayStringToSerial(eVal);
-        if (serE != null) {
-          ws[addrE] = { t: 'n', v: serE, z: ONE_DAY_FMT };
-          cellE = ws[addrE];
-          eVal = serE;
-        }
-      }
+    var changedRows = 0;
+    var convertedTimeCells = 0;
+    var rn;
+    for (rn = 2; rn <= last; rn++) {
+      var row = ws.getRow(rn);
 
-      var arrMin = parseTimeToMinutes(eVal, cellE);
-      var depMin = parseTimeToMinutes(gVal, cellG);
+      var cellE = row.getCell(colAnkomst);
+      var cellG = row.getCell(colAvgang);
 
-      var addrTrain = XLSX.utils.encode_cell({ r: r, c: colTåg });
-      var cellTrain = ws[addrTrain];
-      var trainRaw = cellTrain ? cellTrain.v : null;
-      var trainNo = normalizeTrainNo(trainRaw);
+      if (convert1dTimeStringIfNeeded(cellE)) convertedTimeCells += 1;
+      if (convert1dTimeStringIfNeeded(cellG)) convertedTimeCells += 1;
 
-      var gapHours = arrMin !== null && depMin !== null ? (depMin - arrMin) / 60 : null;
+      var fracE = cellToFracDays(cellE);
+      var fracG = cellToFracDays(cellG);
 
-      if (gapHours !== null && gapHours >= 6 && trainNo !== '') {
-        var addrI = XLSX.utils.encode_cell({ r: r, c: colNytt });
-        ws[addrI] = { t: 'str', v: 'v' + trainNo };
+      var cellTrain = row.getCell(colTag);
+      var trainNo = normalizeTrainNo(cellTrain.value);
+
+      var gapHours =
+        fracE !== null && fracG !== null ? (fracG - fracE) * 24 : null;
+
+      if (gapHours !== null && gapHours + 1e-9 >= 6 && trainNo !== '') {
+        var cellNy = row.getCell(colNytt);
+        var nextValue = 'v' + trainNo;
+        if (plainValue(cellNy.value) !== nextValue) changedRows += 1;
+        cellNy.value = nextValue;
       }
     }
 
-    return true;
+    return {
+      changedRows: changedRows,
+      convertedTimeCells: convertedTimeCells,
+    };
   }
 
   function baseName(fname) {
     var i = fname.lastIndexOf('.');
-    if (i === -1) return fname + '-processed';
-    return fname.slice(0, i) + '-processed' + fname.slice(i);
+    if (i === -1) return fname + '-updaterad';
+    return fname.slice(0, i) + '-updaterad' + fname.slice(i);
   }
 
   document.getElementById('fileInput').addEventListener('change', function (ev) {
@@ -180,28 +258,44 @@
 
     var name = file.name || 'workbook.xlsx';
     var lower = name.toLowerCase();
-    if (!(lower.endsWith('.xlsx') || file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) {
+    if (
+      !(lower.endsWith('.xlsx') ||
+        file.type === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    ) {
       return;
     }
 
-    var reader = new FileReader();
-    reader.onload = function () {
-      var data = reader.result;
+    (async function () {
       try {
-        var wb = XLSX.read(data, { type: 'array', cellDates: false });
-        var ok = processWorkbook(wb);
-        if (!ok) return;
-        var out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+        if (typeof ExcelJS === 'undefined') {
+          setStatus('Kunde inte ladda Excel-biblioteket.');
+          return;
+        }
+        setStatus('Bearbetar...');
+        var wb = new ExcelJS.Workbook();
+        var buf = await file.arrayBuffer();
+        await wb.xlsx.load(buf);
+        var result = processWorkbook(wb);
+        if (!result) {
+          setStatus('Hittade inte rätt kolumner.');
+          return;
+        }
+        var out = await wb.xlsx.writeBuffer();
         var blob = new Blob([out], {
           type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         });
         triggerDownload(blob, baseName(name));
+        setStatus('Klar: ' + result.changedRows + ' rader uppdaterade.');
       } catch (e) {
+        setStatus('Kunde inte bearbeta filen.');
         return;
       }
-    };
-    reader.readAsArrayBuffer(file);
+    })();
   });
+
+  window.TLSWorkbookTool = {
+    processWorkbook: processWorkbook,
+  };
 })();
   </script>
 </body>
